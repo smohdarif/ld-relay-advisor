@@ -47,6 +47,7 @@ ld-relay-advisor/
       configuration-reference.md
       codebase-notes.md           # Key findings from ld-relay source
       client-patterns.md          # Anonymized patterns
+      field-guide-relay.md        # Extracted from LD Field Guide (pp.78-148)
 
   templates/
     report.typ                    # Typst template for PDF report
@@ -54,6 +55,9 @@ ld-relay-advisor/
       proxy-mode.toml
       proxy-mode-redis.toml
       daemon-mode.toml
+      daemon-mode-dynamodb.toml
+      offline-mode.toml
+      offline-mode-file.toml
       proxy-mode-cloud.toml
 
   assets/
@@ -99,6 +103,20 @@ class InfraPreference(Enum):
     CENTRALIZED = "centralized"
     EMBEDDED = "embedded"
 
+class DeploymentPlatform(Enum):
+    KUBERNETES = "kubernetes"
+    ECS_FARGATE = "ecs-fargate"
+    DOCKER = "docker"
+    VM_BARE_METAL = "vm-bare-metal"
+
+class ReverseProxy(Enum):
+    NGINX = "nginx"
+    HAPROXY = "haproxy"
+    ALB = "alb"
+    CLOUDFLARE = "cloudflare"
+    OTHER = "other"
+    NONE = "none"
+
 class ServiceCount(Enum):
     SMALL = "<10"
     MEDIUM = "10-50"
@@ -116,6 +134,12 @@ class SegmentComplexity(Enum):
     MODERATE = "moderate"       # Mix of simple and multi-rule flags
     COMPLEX = "complex"         # Many rules, large segments, Big Segments likely
 
+class PersistentStore(Enum):
+    REDIS = "redis"
+    DYNAMODB = "dynamodb"
+    CONSUL = "consul"
+    NONE = "none"
+
 @dataclass
 class ClientProfile:
     # Company
@@ -124,6 +148,8 @@ class ClientProfile:
     # Infrastructure
     hosting: Hosting = Hosting.ON_PREM
     internet_access: InternetAccess = InternetAccess.PROXY_FIREWALL
+    deployment_platform: DeploymentPlatform = DeploymentPlatform.KUBERNETES
+    reverse_proxy: ReverseProxy = ReverseProxy.NONE
     has_browser_apps: bool = False
     has_server_apps: bool = True
     server_languages: list = field(default_factory=list)
@@ -137,6 +163,7 @@ class ClientProfile:
 
     # Preferences
     infra_preference: InfraPreference = InfraPreference.CENTRALIZED
+    preferred_store: PersistentStore = PersistentStore.NONE
     existing_datastore: str = "none"   # redis, dynamodb, consul, none
     redis_shared: bool = False
     redis_compliance: str = "none"     # pci, soc2, none, unknown
@@ -146,8 +173,9 @@ class ClientProfile:
     security_review_needed: bool = True
     adblocker_concern: bool = False
 
-    # Scale
-    peak_connections: ConnectionScale = ConnectionScale.MEDIUM
+    # Scale (split server-side vs client-side)
+    server_side_connections: ConnectionScale = ConnectionScale.MEDIUM
+    client_side_connections: ConnectionScale = ConnectionScale.SMALL
     container_orchestration: str = "none"  # kubernetes, ecs, docker-swarm, none
     multi_deployment: bool = False
 
@@ -161,29 +189,56 @@ class ClientProfile:
 ```python
 # Each rule returns a tuple: (decision: bool/str, reasons: list[str])
 
-def needs_relay_proxy(profile: ClientProfile) -> tuple[bool, list[str]]:
-    """Determine if the client needs a Relay Proxy."""
-    reasons = []
+def needs_relay_proxy(profile: ClientProfile) -> tuple[bool, list[str], list[str]]:
+    """Determine if the client needs a Relay Proxy.
+    Returns (decision, reasons_for, reasons_against).
+    """
+    reasons_for = []
+    reasons_against = []
 
+    # Reasons FOR relay
     if profile.hosting in (Hosting.ON_PREM, Hosting.HYBRID, Hosting.CUSTOMER_HOSTED):
-        reasons.append("Applications hosted on-prem or in hybrid environment")
+        reasons_for.append("Applications hosted on-prem or in hybrid environment")
 
     if profile.internet_access != InternetAccess.DIRECT:
-        reasons.append(f"Traffic routed through {profile.internet_access.value}")
+        reasons_for.append(f"Traffic routed through {profile.internet_access.value}")
 
     if profile.air_gapped:
-        reasons.append("Air-gapped environment requires offline mode")
+        reasons_for.append("Air-gapped environment requires offline mode")
 
     if profile.service_count in (ServiceCount.LARGE, ServiceCount.XLARGE):
-        reasons.append(f"{profile.service_count.value} services - Relay reduces outbound connections")
+        reasons_for.append(f"{profile.service_count.value} services - Relay reduces outbound connections")
 
     if profile.adblocker_concern:
-        reasons.append("Ad-blockers may block direct LD connections from browsers")
+        reasons_for.append("Ad-blockers may block direct LD connections from browsers")
 
     if profile.infra_preference == InfraPreference.CENTRALIZED:
-        reasons.append("Preference for centralized infrastructure aligns with Relay Proxy")
+        reasons_for.append("Preference for centralized infrastructure aligns with Relay Proxy")
 
-    return (len(reasons) > 0, reasons)
+    if len(profile.compliance) > 0:
+        reasons_for.append(f"Compliance requirements ({', '.join(profile.compliance)}) - Relay enables traffic inspection and TLS termination")
+
+    # Reasons AGAINST relay (anti-patterns from Field Guide pp.82-83)
+    if profile.service_count == ServiceCount.SMALL and profile.has_server_apps:
+        reasons_against.append("Fewer than 10 server-side SDK instances - connection savings are minimal")
+
+    if profile.internet_access == InternetAccess.DIRECT and not profile.air_gapped:
+        reasons_against.append("SDKs can reach LaunchDarkly directly - Relay adds infrastructure complexity without clear benefit")
+
+    if profile.has_browser_apps and not profile.has_server_apps:
+        reasons_against.append("Client-side SDKs only - LaunchDarkly's CDN-backed endpoints already handle high-scale client traffic")
+
+    if profile.client_side_connections in (ConnectionScale.LARGE, ConnectionScale.XLARGE) and not profile.has_server_apps:
+        reasons_against.append("Client-side SDK streaming through Relay is 'not efficient' at scale (LD official guidance)")
+
+    # Decision: reasons_for wins if any exist, but always surface trade-offs
+    decision = len(reasons_for) > 0
+
+    # If no strong reasons for and there are reasons against, recommend no
+    if not decision and len(reasons_against) > 0:
+        decision = False
+
+    return (decision, reasons_for, reasons_against)
 
 
 def recommend_mode(profile: ClientProfile) -> tuple[str, list[str]]:
@@ -202,6 +257,17 @@ def recommend_mode(profile: ClientProfile) -> tuple[str, list[str]]:
         reasons.append("PHP cannot maintain streaming connections - daemon mode preferred")
         return ("daemon", reasons)
 
+    # New: large server-side fleet + existing shared store = daemon candidate
+    # (Field Guide pp.86-88)
+    if (profile.service_count in (ServiceCount.LARGE, ServiceCount.XLARGE)
+            and profile.existing_datastore != "none"
+            and profile.infra_preference == InfraPreference.EMBEDDED):
+        reasons.append(
+            f"{profile.service_count.value} server-side instances with existing "
+            f"{profile.existing_datastore} - daemon mode eliminates streaming connections to Relay"
+        )
+        return ("daemon", reasons)
+
     if profile.infra_preference == InfraPreference.CENTRALIZED:
         reasons.append("Centralized infrastructure preference aligns with proxy mode")
 
@@ -209,21 +275,34 @@ def recommend_mode(profile: ClientProfile) -> tuple[str, list[str]]:
     return ("proxy", reasons)
 
 
-def needs_redis(profile: ClientProfile, mode: str) -> tuple[bool, list[str]]:
-    """Determine if Redis is needed."""
+def needs_persistent_store(profile: ClientProfile, mode: str) -> tuple[bool, str, list[str]]:
+    """Determine if a persistent store is needed and which one.
+    Returns (needed, recommended_store, reasons).
+    """
     reasons = []
 
-    if mode == "daemon":
-        reasons.append("Daemon mode requires a persistent store (Redis, DynamoDB, or Consul)")
-        return (True, reasons)
+    if mode in ("daemon", "offline"):
+        reasons.append(f"{mode.capitalize()} mode requires a persistent store")
+        store = profile.preferred_store.value if profile.preferred_store != PersistentStore.NONE else "redis"
+        return (True, store, reasons)
 
     if profile.outage_tolerance == OutageTolerance.ZERO_DOWNTIME:
-        reasons.append("Zero-downtime requirement - Redis ensures flag data survives Relay restarts during LD outages")
+        reasons.append("Zero-downtime requirement - persistent store ensures flag data survives Relay restarts during LD outages")
 
     if profile.frequent_deployments:
-        reasons.append("Frequent deployments mean new instances need flag data on startup - Redis provides cold-start protection")
+        reasons.append("Frequent deployments mean new instances need flag data on startup - persistent store provides cold-start protection")
 
-    return (len(reasons) > 0, reasons)
+    needed = len(reasons) > 0
+
+    # Recommend based on preference or existing infra
+    if profile.preferred_store != PersistentStore.NONE:
+        store = profile.preferred_store.value
+    elif profile.existing_datastore != "none":
+        store = profile.existing_datastore
+    else:
+        store = "redis"  # Redis is most common per Field Guide
+
+    return (needed, store, reasons)
 
 
 def redis_recommendations(profile: ClientProfile) -> dict:
@@ -292,6 +371,7 @@ def calculate_relay_sizing(profile):
         "memory_per_instance_gb": ESTIMATE_RELAY_MEMORY_GB,
         "disk_per_instance_gb": ESTIMATE_DISK_GB,
         "network_note": "Network bandwidth is the most important resource (LD official guidance)",
+        "file_descriptor_note": "Each connected SDK uses one file descriptor. Ensure OS limits match expected connection count.",
         "reference": f"Tested on AWS {OFFICIAL_INSTANCE_TYPE} ({OFFICIAL_VCPU} vCPU, {OFFICIAL_MEMORY_GIB} GiB)",
         "source": "https://launchdarkly.com/docs/sdk/relay-proxy/guidelines",
         "is_official": {
@@ -315,6 +395,55 @@ def calculate_redis_sizing(profile):
         "cache_ttl": "infinite (-1) per LD recommendation",
         "source": "Estimates based on general best practices. Not from official LD documentation.",
     }
+
+# Scaling signals and alerting thresholds (from LD Field Guide pp.111-118)
+SCALING_SIGNALS = {
+    "cpu_threshold": {
+        "value": "70%",
+        "duration": "sustained 10 minutes",
+        "severity": "medium",
+        "action": "Scale horizontally - add more Relay instances",
+    },
+    "memory_growth": {
+        "value": "20% increase in 1 hour",
+        "severity": "medium",
+        "action": "Investigate environment count and segment data sizes",
+    },
+    "connection_drop": {
+        "value": "50% drop",
+        "severity": "high",
+        "action": "Investigate Relay health and load balancer configuration",
+    },
+    "env_disconnected": {
+        "value": "Any environment disconnected > 5 minutes",
+        "severity": "high",
+        "action": "Investigate Relay connectivity to LaunchDarkly",
+    },
+    "event_lag": {
+        "value": "Event forwarding delayed > 5 minutes",
+        "severity": "medium",
+        "action": "Check Relay backlog and LaunchDarkly event ingestion",
+    },
+    "status_unreachable": {
+        "value": "Status endpoint unreachable",
+        "severity": "critical",
+        "action": "Relay process may be down - check process health",
+    },
+}
+
+# Environment partitioning strategy (Field Guide pp.95-97)
+def recommend_partitioning(profile):
+    """Recommend whether to partition Relay clusters by environment tier."""
+    if profile.environment_count >= 5:
+        return {
+            "partition": True,
+            "reason": (
+                f"{profile.environment_count} environments. Separate Relay clusters "
+                "for production vs non-production to limit blast radius."
+            ),
+            "example": "Cluster A: production environments. Cluster B: staging + dev.",
+        }
+    return {"partition": False, "reason": "Environment count is low enough for a single cluster."}
 ```
 
 ### 2.4 templates/report.typ
@@ -325,15 +454,19 @@ Key sections:
 1. Title page (company name, date, "Prepared by LD Relay Advisor")
 2. Executive summary (1 paragraph, auto-generated from decisions)
 3. Your environment (table from ClientProfile)
-4. Recommendation (relay needed? mode? redis?)
+4. Recommendation (relay needed? mode? persistent store? with reasons FOR and AGAINST)
 5. Architecture diagram
 6. Sizing table
 7. Network requirements
-8. Security FAQ
-9. Cache and resilience overview
-10. Sample configuration
-11. Open items
-12. References
+8. Reverse proxy/LB configuration checklist (conditional)
+9. Deployment guidance (platform-specific)
+10. Security FAQ
+11. Cache and resilience overview
+12. Monitoring and alerting playbook
+13. Rolling deployment runbook
+14. Sample configuration (TOML + AutoConfig policies)
+15. Open items
+16. References (LD docs + Field Guide citations)
 
 ### 2.5 modules/chat.py (RAG)
 
@@ -382,13 +515,14 @@ app.py
   |
   |-- page: "Discovery"
   |     Multi-step form (Module 1)
-  |     Progress bar: Infrastructure -> Resilience -> Preferences -> Security -> Scale
+  |     Progress bar: Company & Infra -> Applications -> Resilience -> Preferences -> Security -> Scale
   |
   |-- page: "Recommendation"
   |     Shows decisions with reasoning (Module 2)
-  |     "Do you need a Relay Proxy?" card
+  |     "Do you need a Relay Proxy?" card (with reasons FOR and AGAINST)
   |     "Recommended mode" card
-  |     "Redis recommendation" card
+  |     "Persistent store recommendation" card (Redis/DynamoDB/Consul)
+  |     "Trade-offs" card (what complexity you're adding)
   |
   |-- page: "Architecture & Sizing"
   |     Architecture diagram (Module 3)
