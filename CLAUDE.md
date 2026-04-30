@@ -47,11 +47,14 @@ When generating any technical content about the Relay Proxy:
 
 ## Tech Stack
 
-- Python + Streamlit (frontend)
+- Next.js 15 + Tailwind + shadcn/ui (frontend, Firebase Hosting)
+- FastAPI Python backend (Cloud Functions Gen 2)
+- Gemini 2.5 Pro on Vertex AI (function calling + streaming)
+- Tool-grounded architecture (structured JSON knowledge files, no RAG)
 - Pure Python rule engine (no ML for decisions)
 - Typst for PDF generation (proven in ARC Airlines workflow)
-- Claude API + RAG for chat module
-- ChromaDB or simple JSON for vector store
+- Mermaid.js for interactive flow diagrams
+- Firebase platform (Hosting + Cloud Functions, single deploy)
 - No persistent storage (session-only, privacy by design)
 
 ## Build Order

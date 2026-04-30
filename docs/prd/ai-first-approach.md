@@ -119,12 +119,12 @@ AI:  [Renders side-by-side flow diagram: proxy vs daemon]
 
 ```
 +-----------------------------------------------------------------+
-|                     Frontend (Next.js)                           |
+|              Frontend (Next.js on Firebase Hosting)               |
 |                                                                 |
 |  +----------------+  +----------------+  +-------------------+  |
 |  |  Chat UI       |  |  Learn Mode    |  |  Artifact Panel   |  |
 |  |  (primary)     |  |  (visual       |  |  (diagrams,       |  |
-|  |                |  |   explainers)  |  |   configs, PDF)   |  |
+|  |  Vercel AI SDK |  |   explainers)  |  |   configs, PDF)   |  |
 |  +-------+--------+  +-------+--------+  +---------+---------+  |
 |          |                    |                      |           |
 |          +--------------------+----------------------+           |
@@ -137,12 +137,12 @@ AI:  [Renders side-by-side flow diagram: proxy vs daemon]
                                   | API calls
                                   v
 +-----------------------------------------------------------------+
-|                   Backend (Python / FastAPI)                      |
+|         Backend (FastAPI on Cloud Functions Gen 2)                |
 |                                                                 |
 |  +----------------+  +----------------+  +-------------------+  |
 |  |  AI Engine     |  |  Rule Engine   |  |  Artifact Gen     |  |
-|  |  (Claude API   |  |  (decisions,   |  |  (PDF, configs,   |  |
-|  |   + tools)     |  |   sizing)      |  |   diagrams)       |  |
+|  |  (Gemini 2.5   |  |  (decisions,   |  |  (PDF, configs,   |  |
+|  |   Pro + tools) |  |   sizing)      |  |   diagrams)       |  |
 |  +----------------+  +----------------+  +-------------------+  |
 |                                                                 |
 |  +----------------+  +----------------+                         |
@@ -157,6 +157,12 @@ AI:  [Renders side-by-side flow diagram: proxy vs daemon]
 |  |  config-defaults, sizing-numbers, mode-behaviors,         |  |
 |  |  failure-scenarios, sc-formulas, anti-patterns, etc.      |  |
 |  +----------------------------------------------------------+  |
++-----------------------------------------------------------------+
+                                  |
+                                  v
++-----------------------------------------------------------------+
+|                    Vertex AI (Gemini 2.5 Pro)                     |
+|  Function calling, streaming, system instructions, 1M context   |
 +-----------------------------------------------------------------+
 ```
 
@@ -829,7 +835,7 @@ graph LR
 
 ### How the AI Conducts Discovery
 
-The AI uses Claude's tool-use capability to extract structured data from conversation. It doesn't ask the user to fill forms. It has a conversation and builds the ClientProfile incrementally.
+The AI uses Gemini's function calling capability to extract structured data from conversation. It doesn't ask the user to fill forms. It has a conversation and builds the ClientProfile incrementally.
 
 ### System Prompt (core)
 
@@ -917,13 +923,269 @@ Conversation turn 5: "PCI compliance, zero downtime requirement"
 | Component | v1 (Streamlit) | v2 (AI-First) | Why the change |
 |-----------|---------------|---------------|----------------|
 | Frontend | Streamlit | **Next.js 15 + Tailwind + shadcn/ui** | Chat UI, inline diagrams, split panels, animations |
-| Chat UI | Streamlit chat (sidebar) | **Vercel AI SDK + streaming** | Real-time token streaming, tool-call rendering, inline artifacts |
+| Chat UI | Streamlit chat (sidebar) | **Vercel AI SDK + streaming** | Real-time token streaming, tool-call rendering, inline artifacts. Works with any backend, not tied to Vercel hosting. |
 | Diagrams | Text-based ASCII | **Mermaid.js rendered in React** | Interactive, clickable, animated flow diagrams |
-| Backend | Streamlit (monolith) | **FastAPI (Python)** | API-first. Serves AI engine, rule engine, artifact generation |
-| AI | Claude API (basic) | **Claude API with tool use** | Tool calls for profile building, grounding, diagram generation |
+| Backend | Streamlit (monolith) | **FastAPI (Python) on Cloud Functions Gen 2** | API-first. Serves AI engine, rule engine, artifact generation. Gen 2 functions are Cloud Run containers, native Python support. |
+| AI | Claude API (basic) | **Gemini 2.5 Pro on Vertex AI (tool use + streaming)** | Native Google AI. Best-in-class function calling for grounding tools. Streaming support. Single billing with Firebase. |
 | Knowledge | ChromaDB + RAG | **Structured JSON files + grounding tools** | Simpler, more reliable, auditable, no embeddings needed |
-| PDF | Typst | **Typst** (no change) | Still the best option for programmatic PDF |
-| Hosting | Streamlit Cloud | **Vercel (frontend) + Railway/Fly (backend)** | Better performance, custom domain, no Streamlit limitations |
+| PDF | Typst | **Typst** (no change) | Still the best option for programmatic PDF. Typst binary bundled in Cloud Function Docker image. |
+| Platform | Streamlit Cloud | **Firebase** | Single platform: Hosting (frontend), Cloud Functions Gen 2 (backend), single billing, single deploy pipeline. |
+
+### Platform: Firebase + Google Cloud
+
+```
+Firebase Hosting                     Cloud Functions Gen 2
+(CDN-backed, global)                 (Cloud Run containers)
++----------------------------+       +----------------------------+
+|  Next.js static export     |       |  FastAPI (Python 3.12)     |
+|  or SSR via Cloud Functions |       |                            |
+|                            |       |  - Claude via Vertex AI    |
+|  /learn   (static pages)   |       |  - Rule engine             |
+|  /advise  (chat UI)        |  -->  |  - Sizing calculator       |
+|                            |  API  |  - Grounding tools         |
+|  Mermaid.js (client-side)  |       |  - Config generator        |
+|  shadcn/ui components      |       |  - Typst PDF generation    |
+|                            |       |  - Diagram generator       |
++----------------------------+       +----------------------------+
+                                              |
+                                              v
+                                     Vertex AI
+                                     +----------------------------+
+                                     |  Gemini 2.5 Pro            |
+                                     |  - Function calling        |
+                                     |    (tool use)              |
+                                     |  - Streaming               |
+                                     |  - System instructions     |
+                                     |  - Native Google auth      |
+                                     +----------------------------+
+```
+
+**Why Firebase + Gemini works for this project:**
+
+1. **Cloud Functions Gen 2 = Cloud Run.** Gen 2 functions run as Docker containers, so our Python/FastAPI backend deploys natively. No Node.js rewrite needed. Supports up to 60-min timeout (plenty for streaming chat + PDF generation).
+
+2. **Gemini on Vertex AI.** Native Google AI. Gemini 2.5 Pro has excellent function calling (our grounding tools), streaming, system instructions, and a 1M token context window. Authenticates via Google Cloud IAM. Single billing.
+
+3. **Firebase Hosting + CDN.** Serves the Next.js frontend from Google's global CDN. Fast page loads worldwide. Custom domain support.
+
+4. **Fully Google stack.** Firebase + Cloud Functions + Vertex AI + Gemini. One GCP project. One bill. One IAM setup. One `firebase deploy`. No third-party API keys to manage.
+
+5. **No database needed.** We don't use Firestore. Session state lives in the frontend (React state) and is passed to the backend per request. Privacy by design.
+
+6. **Firebase AI SDK option.** Firebase has a client-side AI SDK (`@firebase/ai`) that can call Gemini directly from the frontend for simple queries. For our grounding-tool architecture, we route through the backend, but the option exists for lighter interactions in Learn mode.
+
+**Firebase-specific deployment:**
+
+```bash
+# Frontend: Next.js static export deployed to Firebase Hosting
+firebase deploy --only hosting
+
+# Backend: FastAPI deployed as Cloud Function Gen 2
+firebase deploy --only functions
+
+# Or use a single firebase.json for both
+firebase deploy
+```
+
+### Gemini on Vertex AI: Implementation
+
+```python
+from google.cloud import aiplatform
+from vertexai.generative_models import (
+    GenerativeModel,
+    Tool,
+    FunctionDeclaration,
+    Part,
+)
+
+# Initialize
+aiplatform.init(project="your-gcp-project", location="us-central1")
+
+# Define grounding tools as Gemini function declarations
+relay_tools = Tool(function_declarations=[
+    FunctionDeclaration(
+        name="get_config_defaults",
+        description="Get verified Relay Proxy config defaults with source citations",
+        parameters={
+            "type": "object",
+            "properties": {
+                "setting": {
+                    "type": "string",
+                    "description": "Config setting name (e.g., cache_ttl, port, heartbeat)"
+                }
+            },
+            "required": ["setting"]
+        }
+    ),
+    FunctionDeclaration(
+        name="get_mode_behavior",
+        description="Get exact behavior of a Relay Proxy mode",
+        parameters={
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["proxy", "daemon", "offline"]
+                }
+            },
+            "required": ["mode"]
+        }
+    ),
+    FunctionDeclaration(
+        name="get_sc_formula",
+        description="Get service connection formula for an architecture pattern",
+        parameters={
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "enum": ["typical_server_side", "forking", "containerized",
+                             "containerized_horizontal", "containerized_forking",
+                             "lambda_serverless", "relay_sidecar"]
+                }
+            },
+            "required": ["pattern"]
+        }
+    ),
+    FunctionDeclaration(
+        name="get_anti_pattern",
+        description="Check if a pattern is a known anti-pattern and get the correct approach",
+        parameters={
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Description of the pattern to check"
+                }
+            },
+            "required": ["pattern"]
+        }
+    ),
+    FunctionDeclaration(
+        name="run_decision_engine",
+        description="Run the deterministic rule engine on a client profile",
+        parameters={
+            "type": "object",
+            "properties": {
+                "profile": {
+                    "type": "object",
+                    "description": "ClientProfile fields collected from conversation"
+                }
+            },
+            "required": ["profile"]
+        }
+    ),
+    FunctionDeclaration(
+        name="run_sizing_calculator",
+        description="Calculate Relay Proxy and persistent store sizing",
+        parameters={
+            "type": "object",
+            "properties": {
+                "profile": {
+                    "type": "object",
+                    "description": "ClientProfile fields"
+                }
+            },
+            "required": ["profile"]
+        }
+    ),
+    FunctionDeclaration(
+        name="generate_diagram",
+        description="Generate a Mermaid diagram for inline display",
+        parameters={
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["proxy-flow", "daemon-flow", "offline-flow",
+                             "architecture", "failure-scenario", "sc-pattern",
+                             "caching-layers", "connection-model"]
+                },
+                "context": {
+                    "type": "object",
+                    "description": "Parameters to customize the diagram"
+                }
+            },
+            "required": ["type"]
+        }
+    ),
+    # ... remaining tool declarations follow same pattern
+])
+
+# Create model with system instruction and tools
+model = GenerativeModel(
+    "gemini-2.5-pro",
+    system_instruction=SYSTEM_PROMPT,    # same system prompt as before
+    tools=[relay_tools],
+)
+
+# Chat session with streaming
+chat = model.start_chat()
+
+# Stream response with function calling
+response = chat.send_message(
+    user_message,
+    stream=True,
+)
+
+# Handle function calls in the response
+for chunk in response:
+    if chunk.candidates[0].content.parts:
+        for part in chunk.candidates[0].content.parts:
+            if part.function_call:
+                # Execute the grounding tool
+                tool_name = part.function_call.name
+                tool_args = dict(part.function_call.args)
+                result = execute_tool(tool_name, tool_args)
+
+                # Send result back to Gemini
+                response = chat.send_message(
+                    Part.from_function_response(
+                        name=tool_name,
+                        response={"result": result}
+                    ),
+                    stream=True,
+                )
+            elif part.text:
+                # Stream text to frontend
+                yield part.text
+```
+
+### Gemini vs Claude for This Use Case
+
+| Capability | Gemini 2.5 Pro | Impact on our app |
+|-----------|----------------|-------------------|
+| Function calling | Excellent (native, parallel) | All 19 grounding tools work. Gemini can call multiple tools in parallel. |
+| Streaming | Yes | Chat responses stream token by token |
+| System instructions | Yes | Same system prompt approach |
+| Context window | 1M tokens | Can fit entire conversation + tool results easily |
+| Thinking/reasoning | Yes (with thinking budget) | Good for complex sizing recommendations |
+| JSON output | Native JSON mode | Clean structured output for diagrams, configs |
+| Google auth | Native IAM | No API keys, uses Application Default Credentials |
+| Pricing | Pay per token on Vertex | Single bill with Firebase |
+
+**One consideration:** If we ever find Gemini's grounding adherence isn't strict enough (i.e., it sometimes states facts from training data instead of calling tools), we can add Vertex AI Grounding as a second layer. This uses Google Search or custom data stores to ground responses. But the tool-call approach should be sufficient for our bounded domain.
+
+### Frontend AI Integration
+
+For the Next.js frontend, we use the **Vercel AI SDK** with a custom provider pointing to our FastAPI backend. The AI SDK is not Vercel-specific. It's an open-source library that handles:
+- Streaming responses from any backend
+- Rendering tool call results inline
+- Managing conversation state
+
+```typescript
+// frontend/lib/ai.ts
+import { useChat } from 'ai/react';
+
+export function useRelayAdvisor() {
+  return useChat({
+    api: '/api/chat',  // proxied to Cloud Function
+    // Handles streaming, tool results, conversation state
+  });
+}
+```
+
+Alternatively, Firebase provides `@firebase/ai` for direct Gemini calls from the client. This could power Learn mode's lighter interactions (concept lookups, quick explanations) without hitting the backend. The heavier Advise mode (grounding tools, rule engine, sizing) always goes through the backend.
 
 ### Why Not Streamlit?
 
@@ -939,11 +1201,11 @@ Streamlit is great for quick prototypes but hits walls for this vision:
 Next.js + shadcn/ui gives us:
 - Beautiful, responsive UI out of the box
 - Split panel layouts with drag-to-resize
-- Vercel AI SDK for streaming chat with tool-call rendering
+- Vercel AI SDK for streaming chat with tool-call rendering (works with any backend, not Vercel-specific)
 - Mermaid.js integration for inline diagrams
 - Dark mode, animations, polished components
 - Route-based navigation (/learn, /advise)
-- Static export option for offline use
+- Static export for Firebase Hosting
 
 ---
 
@@ -955,13 +1217,15 @@ Next.js + shadcn/ui gives us:
 
 Build:
 - Next.js app with Tailwind + shadcn/ui
-- FastAPI backend with Claude API integration
+- Firebase project setup (Hosting + Cloud Functions Gen 2)
+- FastAPI backend deployed as Cloud Function
+- Gemini 2.5 Pro integration via Vertex AI SDK (function calling + streaming)
 - AI system prompt with tool-use for profile building
 - Grounding tools (config defaults, mode behaviors, sizing numbers)
 - Structured knowledge JSON files (initial set)
 - Rule engine (port existing Python logic)
-- Basic chat UI with streaming responses
-- Profile extraction from conversation via tool calls
+- Basic chat UI with streaming responses (Vercel AI SDK)
+- Profile extraction from conversation via Gemini function calls
 - Recommendation display (inline in chat)
 
 Skip:
@@ -973,8 +1237,8 @@ Skip:
 Done when:
 - User can have a natural conversation about their setup
 - AI asks smart follow-up questions
-- AI calls grounding tools for all technical facts (never hallucinates)
-- AI calls the rule engine and shows a recommendation
+- Gemini calls grounding tools for all technical facts (never hallucinates)
+- Gemini calls the rule engine and shows a recommendation
 - Recommendation includes reasons FOR and AGAINST
 - Anti-patterns detected and warned about
 
@@ -1062,7 +1326,7 @@ Build:
 - Quick action buttons ("Explain proxy mode", "Size my setup", "Compare modes", "Estimate SCs")
 - Onboarding flow for first-time users
 - "About" page
-- Deploy: Vercel (frontend) + Railway (backend)
+- Deploy: `firebase deploy` (Hosting + Cloud Functions)
 - Custom domain
 - End-to-end testing with all 5 client scenarios
 
@@ -1109,11 +1373,16 @@ Pre-built conversation starters for common needs:
 
 ---
 
-## File Structure (Revised)
+## File Structure (Revised for Firebase)
 
 ```
 ld-relay-advisor/
-  frontend/                        # Next.js app
+  firebase.json                    # Firebase config (hosting + functions)
+  .firebaserc                      # Firebase project alias
+
+  frontend/                        # Next.js app (deployed to Firebase Hosting)
+    next.config.ts                 # Next.js config (static export for Firebase)
+    package.json
     app/
       layout.tsx                   # Root layout with nav
       page.tsx                     # Landing / mode selector
@@ -1156,17 +1425,19 @@ ld-relay-advisor/
         ConceptCard.tsx            # Visual concept explainer
         SCCalculator.tsx           # Interactive SC estimator
     lib/
-      api.ts                       # Backend API client
+      api.ts                       # Backend API client (calls Cloud Functions)
       types.ts                     # TypeScript types matching Python models
 
-  backend/                         # FastAPI app
-    main.py                        # FastAPI entry point
+  functions/                       # Cloud Functions Gen 2 (Python)
+    main.py                        # FastAPI app entry point
+    requirements.txt               # Python deps (google-cloud-aiplatform, fastapi, typst, etc.)
+    Dockerfile                     # For Gen 2 Docker-based deploy
     routers/
-      chat.py                      # Chat endpoint (streaming)
+      chat.py                      # Chat endpoint (streaming via Gemini)
       artifacts.py                 # Artifact generation endpoints
       report.py                    # PDF generation endpoint
     engine/
-      rules.py                     # Decision rules
+      rules.py                     # Decision rules (deterministic)
       sizing_calculator.py         # Sizing math + SC estimation
       config_generator.py          # TOML config generation
       diagram_generator.py         # Mermaid diagram generation
@@ -1174,7 +1445,8 @@ ld-relay-advisor/
     ai/
       system_prompt.py             # AI system prompt
       tools.py                     # Grounding tool implementations
-      tool_definitions.py          # Tool schemas for Claude API
+      tool_definitions.py          # Gemini function declarations
+      gemini_client.py             # Vertex AI Gemini client wrapper
     knowledge/                     # Structured knowledge files (JSON)
       config-defaults.json
       sizing-numbers.json
@@ -1200,6 +1472,36 @@ ld-relay-advisor/
   docs/                            # Planning docs (existing)
   research/                        # Research (existing)
 ```
+
+### Firebase Configuration
+
+```json
+// firebase.json
+{
+  "hosting": {
+    "source": "frontend",
+    "public": "out",
+    "ignore": ["firebase.json", "**/node_modules/**"],
+    "rewrites": [
+      {
+        "source": "/api/**",
+        "function": "relay_advisor_api"
+      },
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  },
+  "functions": {
+    "source": "functions",
+    "runtime": "python312",
+    "gen": 2
+  }
+}
+```
+
+This routes `/api/*` requests to the Cloud Function and everything else to the Next.js static frontend.
 
 ---
 
